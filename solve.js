@@ -34,12 +34,34 @@ function trimLine(line) {
 
 // ---------------------------------------------------------------- text (lib/text.js)
 
-const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESCAPE_RE = /[&<>"']/g;
+const ESCAPE_TEST = /[&<>"']/; // non-global: .test() must not carry lastIndex
 
-/** `text` with & < > " and ' escaped. */
+/**
+ * `text` with & < > " and ' escaped. Fast paths, all identical to a single
+ * replace(/[&<>"']/g): a regex test returns clean strings untouched (the
+ * common case — most runs hold no escapable character); a dirty string is
+ * escaped in one manual pass (faster than replace with a callback).
+ * (Memoizing escapeHtml was measured slower — Map churn beat the hit rate —
+ * so there is deliberately no cache here.)
+ */
 function escapeHtml(text) {
-  return text.replace(ESCAPE_RE, (c) => ESCAPES[c]);
+  if (!ESCAPE_TEST.test(text)) return text;
+  let out = '';
+  let s = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    let e = null;
+    if (c === 38) e = '&amp;';
+    else if (c === 60) e = '&lt;';
+    else if (c === 62) e = '&gt;';
+    else if (c === 34) e = '&quot;';
+    else if (c === 39) e = '&#39;';
+    if (e !== null) {
+      out += text.slice(s, i) + e;
+      s = i + 1;
+    }
+  }
+  return s === 0 ? text : out + text.slice(s);
 }
 
 /** The most characters a slug keeps before a collision suffix. */
@@ -282,29 +304,36 @@ function endsParagraph(line) {
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+/** The first index from `from` (up to `end`) where `s` holds `what` outside a backslash escape, or -1.
+ * indexOf in C finds candidates; a candidate is escaped exactly when the run
+ * of backslashes immediately before it (counted from `from`, as the reference
+ * scan pairs them left to right) has odd length — an even run pairs the
+ * backslashes off and leaves the candidate unescaped. */
+function findUnescaped(s, what, from, end) {
+  let j = s.indexOf(what, from);
+  while (j !== -1 && j + what.length <= end) {
+    let b = 0;
+    for (let k = j - 1; k >= from && s.charCodeAt(k) === 92; k--) b++;
+    if (b % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
+/** The first single * from `from` (up to `end`; one whose run is not **), outside an escape, or -1.
+ * Same indexOf + backslash-parity scheme; a `*` followed by `*` is a `**` pair
+ * and is skipped as a pair, exactly as the reference scan does. */
+function findSingleStar(s, from, end) {
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < end) {
+    let b = 0;
+    for (let k = j - 1; k >= from && s.charCodeAt(k) === 92; k--) b++;
+    if (b % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -312,21 +341,33 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+/** The first index >= `from` (and < `end`) holding `\`, `` ` ``, `*` or `[`, or `end` if none. */
+function firstSpecial(s, from, end) {
+  let j = end;
+  let k;
+  k = s.indexOf('\\', from);
+  if (k !== -1 && k < j) j = k;
+  k = s.indexOf('`', from);
+  if (k !== -1 && k < j) j = k;
+  k = s.indexOf('*', from);
+  if (k !== -1 && k < j) j = k;
+  k = s.indexOf('[', from);
+  if (k !== -1 && k < j) j = k;
+  return j;
+}
+
 /**
- * `s` rendered inline into `out` (an array of strings, joined by the caller);
- * `env.link(target)` is a link's href. Bulk runs between specials are escaped in
- * one replace, instead of one escapeHtml call per character.
- */
-function inlineInto(s, env, out) {
-  let i = 0;
-  const n = s.length;
+ * `s` rendered inline into `out` (an array of strings, joined by the caller),
+ * over the range [start, end) — ranges, never slices, so nested strong/em/link
+ * text costs no substring allocation; `env.link(target)` is a link's href.
+ * Bulk runs between specials are escaped in one replace, instead of one
+ * escapeHtml call per character. Callers must pass one contiguous string:
+ * emphasis/link markers may span the '\n' between joined lines. */
+function inlineInto(s, env, out, start = 0, end = s.length) {
+  let i = start;
+  const n = end;
   while (i < n) {
-    let j = i;
-    while (j < n) {
-      const c = s.charCodeAt(j);
-      if (c === 92 || c === 96 || c === 42 || c === 91) break; // \ ` * [
-      j++;
-    }
+    const j = firstSpecial(s, i, n);
     if (j > i) out.push(escapeHtml(s.slice(i, j)));
     if (j >= n) break;
     i = j;
@@ -343,7 +384,7 @@ function inlineInto(s, env, out) {
     }
     if (c === '`') {
       const k = s.indexOf('`', i + 1);
-      if (k > i + 1) {
+      if (k !== -1 && k < n && k > i + 1) {
         out.push('<code>', escapeHtml(s.slice(i + 1, k)), '</code>');
         i = k + 1;
       } else {
@@ -354,10 +395,10 @@ function inlineInto(s, env, out) {
     }
     if (c === '*') {
       if (s[i + 1] === '*') {
-        const k = findUnescaped(s, '**', i + 2);
+        const k = findUnescaped(s, '**', i + 2, n);
         if (k > i + 2) {
           out.push('<strong>');
-          inlineInto(s.slice(i + 2, k), env, out);
+          inlineInto(s, env, out, i + 2, k);
           out.push('</strong>');
           i = k + 2;
         } else {
@@ -365,10 +406,10 @@ function inlineInto(s, env, out) {
           i += 2;
         }
       } else {
-        const k = findSingleStar(s, i + 1);
+        const k = findSingleStar(s, i + 1, n);
         if (k > i + 1) {
           out.push('<em>');
-          inlineInto(s.slice(i + 1, k), env, out);
+          inlineInto(s, env, out, i + 1, k);
           out.push('</em>');
           i = k + 1;
         } else {
@@ -379,12 +420,12 @@ function inlineInto(s, env, out) {
       continue;
     }
     // c === '['
-    const k = findUnescaped(s, ']', i + 1);
+    const k = findUnescaped(s, ']', i + 1, n);
     const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-    const target = m === -1 ? '' : s.slice(k + 2, m);
+    const target = m === -1 || m >= n ? '' : s.slice(k + 2, m);
     if (target !== '' && !WHITESPACE.test(target)) {
       out.push('<a href="', escapeHtml(env.link(target)), '">');
-      inlineInto(s.slice(i + 1, k), env, out);
+      inlineInto(s, env, out, i + 1, k);
       out.push('</a>');
       i = m + 1;
       continue;
@@ -431,10 +472,15 @@ function renderMarkdown(src, env) {
         if (lang !== '') parts.push(' class="language-', escapeHtml(lang), '"');
         parts.push('>');
         i++;
+        // Bulk escape: the fence lines joined with '\n', escaped once — identical
+        // to escaping each line then joining with '\n', because '\n' is not in
+        // the escape table and no escape spans the boundary.
+        const fenceLines = [];
         while (i < n && !FENCE_CLOSE.test(lines[i])) {
-          parts.push(escapeHtml(lines[i]), '\n');
+          fenceLines.push(lines[i]);
           i++;
         }
+        if (fenceLines.length > 0) parts.push(escapeHtml(fenceLines.join('\n')), '\n');
         i++;
         parts.push('</code></pre>\n');
         continue;
@@ -464,7 +510,11 @@ function renderMarkdown(src, env) {
       }
       const qlines = body.map(trimLine).filter((l) => l !== '');
       if (qlines.length === 0) parts.push('<blockquote>\n</blockquote>\n');
-      else parts.push(`<blockquote>\n<p>${inline(qlines.join('\n'), env)}</p>\n</blockquote>\n`);
+      else {
+        parts.push('<blockquote>\n<p>');
+        inlineInto(qlines.join('\n'), env, parts);
+        parts.push('</p>\n</blockquote>\n');
+      }
       continue;
     }
     // List (bullet first, then ordered) or paragraph.
@@ -488,16 +538,30 @@ function renderMarkdown(src, env) {
       const start = isOrdered ? Number(ordered[1]) : 1;
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
       parts.push(open, '\n');
-      for (const item of items) parts.push(`<li>${inline(item.join('\n'), env)}</li>\n`);
+      for (const item of items) {
+        parts.push('<li>');
+        inlineInto(item.join('\n'), env, parts);
+        parts.push('</li>\n');
+      }
       parts.push(`</${tag}>\n`);
       continue;
     }
     const body = [trimLine(line)];
     i++;
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inline(body.join('\n'), env);
-    if (excerpt === null) excerpt = html;
-    parts.push(`<p>${html}</p>\n`);
+    const joined = body.join('\n');
+    if (excerpt === null) {
+      // The first paragraph is also the excerpt: render into a temp array,
+      // join it once for the excerpt, and reuse the pieces for the output.
+      const htmlParts = [];
+      inlineInto(joined, env, htmlParts);
+      excerpt = htmlParts.join('');
+      parts.push('<p>', ...htmlParts, '</p>\n');
+    } else {
+      parts.push('<p>');
+      inlineInto(joined, env, parts);
+      parts.push('</p>\n');
+    }
   }
   return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
 }
@@ -634,6 +698,11 @@ function truthy(v) {
 /**
  * `nodes` rendered into `out` (an array of strings) in `scope` ({ vars, parent }).
  * `ctx` holds the parsed templates, the HTML escape and the include depth.
+ * This is the interpreter; layouts() normally uses the compiled renderers
+ * below (compileTemplate), which flatten the same node tree into a function.
+ * The interpreter stays as the fallback when code generation is unavailable
+ * (e.g. --disallow-code-generation-from-strings) — compile failure falls back
+ * to it, so output is identical either way.
  */
 function renderNodesInto(nodes, scope, ctx, depth, out) {
   for (const n of nodes) {
@@ -671,12 +740,188 @@ function renderNodesInto(nodes, scope, ctx, depth, out) {
   }
 }
 
+/**
+ * Compile a parsed template node tree into a render function
+ * `(scope, out, depth) => void`, generated at runtime from the tree itself
+ * (no prebuilt artifact). Semantics are the interpreter's, statement for
+ * statement: text/var/raw push the same strings, `if` uses the same
+ * truthy()/not logic, `for` builds the same scope object with the same
+ * `loop` fields, `include` respects the same depth cap 8 and skips a missing
+ * template. The only difference is control flow: native if/for instead of a
+ * node-dispatch switch and a recursive call per node. `H` carries the
+ * helpers (lookup/textOf/truthy/escapeHtml) and the map of compiled
+ * templates, so an include is one direct call. Throws if code generation
+ * is disallowed — the caller falls back to the interpreter.
+ */
+function compileBody(nodes) {
+  let uid = 0;
+  const emit = (ns) => {
+    let code = '';
+    for (const n of ns) {
+      if (n.kind === 'text') code += `out.push(${JSON.stringify(n.text)});`;
+      else if (n.kind === 'var') code += `out.push(H.escapeHtml(H.textOf(H.lookup(scope,${JSON.stringify(n.path)}))));`;
+      else if (n.kind === 'raw') code += `out.push(H.textOf(H.lookup(scope,${JSON.stringify(n.path)})));`;
+      else if (n.kind === 'if') {
+        const cond = n.not ? `!H.truthy(H.lookup(scope,${JSON.stringify(n.path)}))` : `H.truthy(H.lookup(scope,${JSON.stringify(n.path)}))`;
+        code += `if(${cond}){${emit(n.then)}}`;
+        if (n.else !== null) code += `else{${emit(n.else)}}`;
+      } else if (n.kind === 'for') {
+        const v = `_v${uid++}`;
+        const x = `_x${uid++}`;
+        const k = `_k${uid++}`;
+        code += `{const ${v}=scope;const ${x}=H.lookup(scope,${JSON.stringify(n.path)});if(Array.isArray(${x})){for(let ${k}=0;${k}<${x}.length;${k}++){scope={vars:{${n.name}:${x}[${k}],loop:{index:${k}+1,first:${k}===0,last:${k}===${x}.length-1,length:${x}.length}},parent:${v}};${emit(n.body)}}scope=${v};}}`;
+      } else if (n.kind === 'include') {
+        const t = `_t${uid++}`;
+        const k = `_k${uid++}`;
+        const m = `_m${uid++}`;
+        const s = `_s${uid++}`;
+        const o = `_o${uid++}`;
+        // Partial-output cache: render once per (template, fingerprint) and
+        // reuse the string; the fingerprint (templateReads + includeKey) is
+        // exactly the values the included template can observe, so a hit is
+        // byte-identical to re-rendering. A miss renders into a temp array.
+        code += `{const ${t}=H.compiled.get(${JSON.stringify(n.name)});if(depth<${INCLUDE_DEPTH}&&${t}!==undefined){const ${k}=H.fp(scope,depth,${JSON.stringify(n.name)});let ${m}=H.cache.get(${JSON.stringify(n.name)});let ${s}=${m}===undefined?undefined:${m}.get(${k});if(${s}===undefined){const ${o}=[];${t}(scope,${o},depth+1);${s}=${o}.join('');if(${m}===undefined){${m}=new Map();H.cache.set(${JSON.stringify(n.name)},${m});}${m}.set(${k},${s});}out.push(${s});}}`;
+      }
+    }
+    return code;
+  };
+  return emit(nodes);
+}
+
+/** Compile every parsed template, or null when code generation is unavailable. */
+function compileTemplates(templates, reads) {
+  const compiled = new Map();
+  const H = { lookup, textOf, truthy, escapeHtml, compiled, reads, cache: new Map(), ids: new WeakMap(), idc: 0 };
+  H.fp = (scope, depth, name) => includeKey(H, scope, depth, name);
+  try {
+    for (const [name, nodes] of templates) {
+      compiled.set(name, new Function('H', `return function(scope,out,depth){${compileBody(nodes)}}`)(H));
+    }
+  } catch {
+    return null;
+  }
+  return compiled;
+}
+
+/**
+ * Each template's transitive reads, in two forms: first segments (for the
+ * include-output cache) and full dotted paths (for lazy field skipping).
+ * Both are fixpoints over the include graph (cycles converge: unions only
+ * grow). Every lookup a render can make is a literal path in some node, so
+ * a dotted path absent from a template's transitive set is never read by it.
+ */
+function templateUsage(templates) {
+  const reads = new Map();
+  const paths = new Map();
+  const edges = new Map();
+  for (const [name, nodes] of templates) {
+    const firsts = new Set();
+    const full = new Set();
+    const inc = new Set();
+    const walk = (ns) => {
+      for (const n of ns) {
+        if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if' || n.kind === 'for') {
+          firsts.add(n.path[0]);
+          full.add(n.path.join('.'));
+        }
+        if (n.kind === 'if') {
+          walk(n.then);
+          if (n.else !== null) walk(n.else);
+        } else if (n.kind === 'for') walk(n.body);
+        else if (n.kind === 'include') inc.add(n.name);
+      }
+    };
+    walk(nodes);
+    reads.set(name, firsts);
+    paths.set(name, full);
+    edges.set(name, inc);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, targets] of edges) {
+      const r = reads.get(name);
+      const p = paths.get(name);
+      for (const t of targets) {
+        const rt = reads.get(t);
+        const pt = paths.get(t);
+        if (rt === undefined) continue;
+        for (const x of rt) {
+          if (!r.has(x)) {
+            r.add(x);
+            changed = true;
+          }
+        }
+        for (const x of pt) {
+          if (!p.has(x)) {
+            p.add(x);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  return { reads: new Map([...reads].map(([k, v]) => [k, [...v]])), paths };
+}
+
+/**
+ * The cache key for including `name` in `scope` at `depth`: the depth plus,
+ * for each of the template's transitive reads, the value it resolves to —
+ * object identity for objects/arrays (their contents are never mutated
+ * during layouts, so identity implies identical output), value for
+ * primitives, `u`/`n` for undefined/null. Two renders with the same key
+ * produce the same string; different values can only miss, never wrongly hit.
+ */
+function includeKey(H, scope, depth, name) {
+  const names = H.reads.get(name) ?? [];
+  let k = `${depth}|`;
+  for (let i = 0; i < names.length; i++) {
+    const v = lookup(scope, [names[i]]);
+    if (v === undefined) k += 'u;';
+    else if (v === null) k += 'n;';
+    else if (typeof v === 'object') {
+      let id = H.ids.get(v);
+      if (id === undefined) {
+        id = ++H.idc;
+        H.ids.set(v, id);
+      }
+      k += `o${id};`;
+    } else k += `${typeof v}:${JSON.stringify(v)};`;
+  }
+  return k;
+}
+
 // ---------------------------------------------------------------- the pipeline (index.js)
 
-/** The words of a body: its runs of characters other than whitespace. */
+/** The words of a body: its runs of characters other than whitespace.
+ * Counts in one pass with no allocation (the reference's match(/\S+/g)
+ * allocates one string per word). Whitespace = JS \s: ASCII <= 32 plus
+ * U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F,
+ * U+3000, U+FEFF; every other code unit (incl. surrogate halves) is a word char.
+ * (U+0085 NEL is NOT JS \s — verified against /\S+/g.) */
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let n = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    const ws =
+      c <= 32 ||
+      c === 0xa0 ||
+      c === 0x1680 ||
+      (c >= 0x2000 && c <= 0x200a) ||
+      c === 0x2028 ||
+      c === 0x2029 ||
+      c === 0x202f ||
+      c === 0x205f ||
+      c === 0x3000 ||
+      c === 0xfeff;
+    if (ws) inWord = false;
+    else if (!inWord) {
+      inWord = true;
+      n++;
+    }
+  }
+  return n;
 }
 
 /** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
@@ -823,8 +1068,9 @@ const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, da
 /** A tag as templates read it (its posts as cards). */
 const tagOf = (b, t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
 
-/** A post's card, as lists show it. */
-function cardOf(s) {
+/** A post's card, as lists show it. `needReading` skips the word count when
+ * the card's reading_minutes can never be read (see layouts). */
+function cardOf(s, needReading = true) {
   return {
     title: s.data.title,
     url: s.url,
@@ -832,15 +1078,15 @@ function cardOf(s) {
     date_long: s.data.date === undefined ? '' : longDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+    reading_minutes: needReading ? Math.max(1, Math.ceil(wordsOf(s.body) / 200)) : 0,
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
   };
 }
 
-/** A page as its layout reads it. */
+/** A page as its layout reads it (reuses the card computed once in layouts). */
 function pageOf(s) {
   return {
-    ...cardOf(s),
+    ...s.card,
     slug: s.slug,
     content: s.html,
     toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -852,16 +1098,31 @@ function pageOf(s) {
 
 /** 7. Every page through its layout, the index pages and the tag pages through theirs. */
 function layouts(b) {
-  b.cards = new Map(b.posts.map((p) => [p, cardOf(p)]));
+  // A source's card needs its word count only when something reads it: a
+  // post's card is read by every list (p.reading_minutes), and a page's card
+  // only through its layout's transitive reads of page.reading_minutes
+  // (a page's card is never listed anywhere else). Anything else is dead:
+  // the page object is only reachable as `page`, and only a literal
+  // page.reading_minutes path can observe the field.
+  const layoutReadsReading = (name) => b.templatePaths.get(name)?.has('page.reading_minutes') ?? false;
+  for (const s of b.sources) s.card = cardOf(s, s.post || layoutReadsReading(s.layout));
+  b.cards = new Map(b.posts.map((p) => [p, p.card]));
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
   const ctx = { templates: b.templates, escape: escapeHtml };
   const render = (name, vars) => {
-    const nodes = b.templates.get(name);
-    if (nodes === undefined) return null;
     const out = [];
-    renderNodesInto(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    const scope = { vars: { site, tags: allTags, recent, ...vars }, parent: null };
+    if (b.compiled !== null) {
+      const fn = b.compiled.get(name);
+      if (fn === undefined) return null;
+      fn(scope, out, 0);
+    } else {
+      const nodes = b.templates.get(name);
+      if (nodes === undefined) return null;
+      renderNodesInto(nodes, scope, ctx, 0, out);
+    }
     return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
@@ -911,10 +1172,13 @@ export function run(input) {
       reportLines.push(err.message);
     }
   }
+  const usage = templateUsage(templates);
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
     templates,
+    compiled: compileTemplates(templates, usage.reads),
+    templatePaths: usage.paths,
     sources: [],
     statics: [],
     bySource: new Map(),
